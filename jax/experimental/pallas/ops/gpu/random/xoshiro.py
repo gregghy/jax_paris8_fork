@@ -1,214 +1,156 @@
+# Copyright 2024 The JAX Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+Implementation of the Xoshiro128++ PRNG as a Pallas kernel.
+
+Unlike the canonical Xoshiro128++ algorithm, which expects 128 bits of
+pre-mixed entropy for initialization, this implementation is adapted for
+massively parallel execution. Because thousands of GPU threads cannot share
+the same initial 128-bit seed, this kernel derives the 128-bit state
+dynamically for each thread. It mixes a global thread index with the provided
+JAX PRNG key using a MurmurHash3 avalanche function and Weyl sequence steps,
+guaranteeing a unique starting state for every thread.
+"""
+import math
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
-import time
+from jax._src import prng
+from jax.experimental.pallas import triton as pltriton
+from jax._src.prng import threefry_2x32
 
-jax.config.update("jax_enable_x64", True)
-
-def xoshiro128pp_kernel(s0_ref, s1_ref, s2_ref, s3_ref,
-                        s0_out, s1_out, s2_out, s3_out,
-                        out_ref):
-  """
-  RNG kernel, runs on a single thread.
-  State in and out need to be sliced before running the kernel
-  Pallas GPU doesn't support slicing at the moment
-  """
-  s0 = s0_ref[...]
-  s1 = s1_ref[...]
-  s2 = s2_ref[...]
-  s3 = s3_ref[...]
-    
-  def rotl32(x, k):
+def rotl32(x, k):
     return (x << jnp.uint32(k)) | (x >> jnp.uint32(32 - k))
 
-  result = rotl32(s0 + s3, 7) + s0
-    
-  t = s1 << jnp.uint32(9)
-  s2 ^= s0
-  s3 ^= s1
-  s1 ^= s2
-  s0 ^= s3
-  s2 ^= t
-  s3 = rotl32(s3, 11)
-   
-  s0_out[...] = s0
-  s1_out[...] = s1
-  s2_out[...] = s2
-  s3_out[...] = s3
-  out_ref[...] = result
-
-def splitmix32_seed_kernel(seed_ref, s0_ref, s1_ref, s2_ref, s3_ref):
-  pid = pl.program_id(0)
-  block_size = s0_ref.shape[0]
-    
-  global_seed = seed_ref[0].astype(jnp.uint32)
-  offsets = jax.lax.iota(jnp.uint32, block_size)
-  base_id = (jnp.uint32(pid) * jnp.uint32(block_size)) + offsets
-    
-  thread_state = base_id + global_seed
-
-  # 32-bit Weyl constant (golden ratio)
-  weyl_const = jnp.uint32(0x9E3779B9)
-
-  def mix32(z):
-    """MurmurHash3 32-bit mixing function"""
+def _mix32(z):
+    """MurmurHash3 / SplitMix32 finalizer"""
+    z += jnp.uint32(1)
     z = (z ^ (z >> jnp.uint32(16))) * jnp.uint32(0x85ebca6b)
     z = (z ^ (z >> jnp.uint32(13))) * jnp.uint32(0xc2b2ae35)
     return z ^ (z >> jnp.uint32(16))
 
-  s0_ref[...] = mix32(thread_state + weyl_const)
-  s1_ref[...] = mix32(thread_state + weyl_const * jnp.uint32(2))
-  s2_ref[...] = mix32(thread_state + weyl_const * jnp.uint32(3))
-  s3_ref[...] = mix32(thread_state + weyl_const * jnp.uint32(4))
+def make_xoshiro_kernel(block_size: int, elements_per_thread: int):
+    def kernel(key_ref, out_ref):
+        pid = pl.program_id(0)
+        idx = jax.lax.iota(jnp.uint32, block_size)
+        global_idx = (pid.astype(jnp.uint32) * jnp.uint32(block_size)) + idx
 
-def splitmix64_seed_kernel(seed_ref, s0_ref, s1_ref, s2_ref, s3_ref):
-  pid = pl.program_id(0)
-  block_size = s0_ref.shape[0]
-  global_seed = seed_ref[0]
+        k0 = key_ref[0]
+        k1 = key_ref[1]
 
-  offsets = jax.lax.iota(jnp.uint64, block_size)
-  base_id = (jnp.uint64(pid) * jnp.uint64(block_size)) + offsets
-  thread_ids = base_id + global_seed
+        # Mix k0 and k1. 0x6C62272E (the upper 32 bits of the FNV-128 offset basis)
+        # is used as a multiplier to break symmetry between k0 and k1.
+        k0_mixed = _mix32(k0)
+        k1_mixed = _mix32(k1) * jnp.uint32(0x6C62272E)
+        thread_state = global_idx ^ k0_mixed ^ k1_mixed
 
-  c1 = (jnp.uint64(0x9e3779b9) << jnp.uint64(32)) | jnp.uint64(0x7f4a7c15)
-  c2 = (jnp.uint64(0xbf58476d) << jnp.uint64(32)) | jnp.uint64(0x1ce4e5b9)
-  c3 = (jnp.uint64(0x94d049bb) << jnp.uint64(32)) | jnp.uint64(0x133111eb)
+        # 0x9E3779B9 is a Weyl sequence constant (golden ratio * 2^32).
+        # We use 4 Weyl steps to initialize the 4 separate 32-bit state words.
+        weyl = jnp.uint32(0x9E3779B9)
+        s0 = _mix32(thread_state + weyl)
+        s1 = _mix32(thread_state + weyl * jnp.uint32(2))
+        s2 = _mix32(thread_state + weyl * jnp.uint32(3))
+        s3 = _mix32(thread_state + weyl * jnp.uint32(4))
 
-  def next_splitmix(state):
-    state = state + c1
-    z = state
-    z = (z ^ (z >> jnp.uint64(30))) * c2
-    z = (z ^ (z >> jnp.uint64(27))) * c3
-    return state, z ^ (z >> jnp.uint64(31))
+        s0 = jnp.where(s0 == 0, jnp.uint32(1), s0)
 
-  state, r1 = next_splitmix(thread_ids)
-  _, r2 = next_splitmix(state)
+        for i in range(elements_per_thread):
+            result = rotl32(s0 + s3, 7) + s0
 
-  s0_ref[...] = (r1 >> jnp.uint64(32)).astype(jnp.uint32)
-  s1_ref[...] = r1.astype(jnp.uint32)
-  s2_ref[...] = (r2 >> jnp.uint64(32)).astype(jnp.uint32)
-  s3_ref[...] = r2.astype(jnp.uint32)
+            t = s1 << jnp.uint32(9)
+            s2 ^= s0
+            s3 ^= s1
+            s1 ^= s2
+            s0 ^= s3
+            s2 ^= t
+            s3 = rotl32(s3, 11)
 
-def generate_random_batch(states, block_size):
-  if isinstance(states, tuple) or isinstance(states, list):
-    s0, s1, s2, s3 = states
-    batch_size = s0.shape[0]
-  else:
-    batch_size = states.shape[0]
-    s0, s1, s2, s3 = states[:, 0], states[:, 1], states[:, 2], states[:, 3]
+            # Note on memory layout (thread-first ordering):
+            # Threads write to columns instead of rows. After flattening (.T) in the
+            # wrapper, the output groups elements by thread. This is intentional to
+            # maximize performance for sequential workloads (like MCTS) by keeping
+            # the stateful generator within registers.
+            out_ref[i, :] = result
 
-  outputs = pl.pallas_call(
-    xoshiro128pp_kernel,
-    in_specs=[
-        pl.BlockSpec((block_size,), lambda i: (i,)),
-        pl.BlockSpec((block_size,), lambda i: (i,)),
-        pl.BlockSpec((block_size,), lambda i: (i,)),
-        pl.BlockSpec((block_size,), lambda i: (i,)),
-    ],
-    out_specs=[
-        pl.BlockSpec((block_size,), lambda i: (i,)),
-        pl.BlockSpec((block_size,), lambda i: (i,)),
-        pl.BlockSpec((block_size,), lambda i: (i,)),
-        pl.BlockSpec((block_size,), lambda i: (i,)),
-        pl.BlockSpec((block_size,), lambda i: (i,))
-    ],
-    grid=(batch_size // block_size,),
-    out_shape=[
-        jax.ShapeDtypeStruct((batch_size,), jnp.uint32),
-        jax.ShapeDtypeStruct((batch_size,), jnp.uint32),
-        jax.ShapeDtypeStruct((batch_size,), jnp.uint32),
-        jax.ShapeDtypeStruct((batch_size,), jnp.uint32),
-        jax.ShapeDtypeStruct((batch_size,), jnp.uint32)
-    ],
-    interpret=True
-    )(s0, s1, s2, s3)
+    return kernel
 
-  out_s0, out_s1, out_s2, out_s3, random_numbers = outputs
+def xoshiro_random_bits(key, bit_width: int, shape, block_size: int = 256, elements_per_thread: int = 8):
+    if bit_width not in (32, 64):
+        raise ValueError(f"bit_width must be 32 or 64, got {bit_width}")
 
-  updated_states = (out_s0, out_s1, out_s2, out_s3)
-  return updated_states, random_numbers
+    multiplier = 2 if bit_width == 64 else 1
+    flat_size = int(math.prod(shape)) * multiplier
 
+    if flat_size > jnp.iinfo(jnp.uint32).max:
+        raise ValueError(
+            f"Shape too large ({flat_size} elements). "
+            f"Shapes larger than {jnp.iinfo(jnp.uint32).max} are not yet supported "
+            "due to 32-bit counter limits."
+        )
 
-def generate_seeds(total_threads, global_seed, block_size, bit_size=64):
-  grid = (total_threads // block_size,)
-    
-  if (bit_size == 64):
-    seed_arr = jnp.array([global_seed], dtype=jnp.uint64)
-    s0, s1, s2, s3 = pl.pallas_call(
-        splitmix64_seed_kernel,
-        in_specs=[
-            pl.BlockSpec((1,), lambda i: (0,))
-        ],
-        out_specs=[
-            # Corrected: Just return 'i'
-            pl.BlockSpec((block_size,), lambda i: (i,)),
-            pl.BlockSpec((block_size,), lambda i: (i,)),
-            pl.BlockSpec((block_size,), lambda i: (i,)),
-            pl.BlockSpec((block_size,), lambda i: (i,))
-        ],
-        grid=grid,
-        out_shape=[
-            jax.ShapeDtypeStruct((total_threads,), jnp.uint32),
-            jax.ShapeDtypeStruct((total_threads,), jnp.uint32),
-            jax.ShapeDtypeStruct((total_threads,), jnp.uint32),
-            jax.ShapeDtypeStruct((total_threads,), jnp.uint32)
-        ],
-        interpret=True
-        )(seed_arr)
-  else:
-    seed_arr = jnp.array([global_seed], dtype=jnp.uint64)
-    s0, s1, s2, s3 = pl.pallas_call(
-        splitmix32_seed_kernel,
-        in_specs=[
-            pl.BlockSpec((1,), lambda i: (0,))
-        ],
-        out_specs=[
-            # Corrected: Just return 'i'
-            pl.BlockSpec((block_size,), lambda i: (i,)),
-            pl.BlockSpec((block_size,), lambda i: (i,)),
-            pl.BlockSpec((block_size,), lambda i: (i,)),
-            pl.BlockSpec((block_size,), lambda i: (i,))
-        ],
-        grid=grid,
-        out_shape=[
-            jax.ShapeDtypeStruct((total_threads,), jnp.uint32),
-            jax.ShapeDtypeStruct((total_threads,), jnp.uint32),
-            jax.ShapeDtypeStruct((total_threads,), jnp.uint32),
-            jax.ShapeDtypeStruct((total_threads,), jnp.uint32)
-        ],
-        interpret=True
-        )(seed_arr)
+    if flat_size == 0:
+        dtype = jnp.uint64 if bit_width == 64 else jnp.uint32
+        return jnp.empty(shape, dtype=dtype)
 
+    tile = block_size * elements_per_thread
+    padded = (flat_size + tile - 1) // tile * tile
+    num_blocks = padded // tile
 
-  return (s0, s1, s2, s3)
+    out_flat = pl.pallas_call(
+        make_xoshiro_kernel(block_size, elements_per_thread),
+        in_specs=[pl.BlockSpec((2,), lambda i: (0,))],
+        out_specs=pl.BlockSpec(
+            (elements_per_thread, block_size), lambda i: (0, i)
+        ),
+        grid=(num_blocks,),
+        out_shape=jax.ShapeDtypeStruct(
+            (elements_per_thread, num_blocks * block_size), jnp.uint32
+        ),
+        compiler_params=pltriton.CompilerParams(),
+    )(key)
 
-if __name__ == "__main__":
-  """
-  total_threads = 2**27
-  dynamic_seed = time.time_ns() # TODO hash this, maybe not necessary
-  start_time_64 = time.time()
-  states64 = generate_seeds(total_threads, global_seed=dynamic_seed, block_size=256, bit_size=64)
-  end_time64 = time.time()
+    out = jnp.reshape(out_flat.T, (-1,))[:flat_size]
 
-  start_time_32 = time.time()
-  states32 = generate_seeds(total_threads, global_seed=dynamic_seed, block_size=256, bit_size=32)
-  end_time32 = time.time()
-  
+    if bit_width == 64:
+        out = jnp.reshape(out, (-1, 2))
+        out = (
+            (out[:, 0].astype(jnp.uint64) << jnp.uint64(32))
+            | out[:, 1].astype(jnp.uint64)
+        )
 
-  time64 = end_time64 - start_time_64
-  time32 = end_time32 - start_time_32
+    return jnp.reshape(out, shape)
 
-  print(f"Execution time 64: {time64:.5f} seconds")
-  print(f"Execution time 32: {time32:.5f} seconds")
-  """
-  dynamic_seed = time.time_ns() # TODO hash this, maybe not necessary
-  states = generate_seeds(total_threads=2**8, global_seed=dynamic_seed, block_size=256, bit_size=64)
-  print("--- Initial States for Xoshiro ---")
-  print(states)
+def xoshiro_split(key, shape):
+    flat_size = int(math.prod(shape))
+    indices = jnp.arange(flat_size, dtype=jnp.uint32)
+    counters = jnp.stack([indices, jnp.zeros_like(indices)], axis=1)
+    new_keys = jax.vmap(lambda c: threefry_2x32(key, c))(counters)
+    return jnp.reshape(new_keys, tuple(shape) + (2,))
 
-  updated_states, random_nums = generate_random_batch(states, block_size=256)
+def xoshiro_fold_in(key, data):
+    data32 = jnp.uint32(data)
+    counter = jnp.array([data32, jnp.uint32(0)], dtype=jnp.uint32)
+    return threefry_2x32(key, counter)
 
-  print("\n--- Updated States ---")
-    
-  print("\n--- Random Numbers ---")
-  print(random_nums)
+plxoshiro_prng_impl = prng.PRNGImpl(
+    key_shape=(2,),
+    seed=prng.threefry_seed,
+    split=xoshiro_split,
+    random_bits=xoshiro_random_bits,
+    fold_in=xoshiro_fold_in,
+    name="pallas_xoshiro128pp",
+    tag="plxos",
+)
+
+prng.register_prng(plxoshiro_prng_impl)
